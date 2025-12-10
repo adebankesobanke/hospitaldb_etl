@@ -1,84 +1,139 @@
+import logging
+import sys
+import pandas as pd
+import psycopg2
+from psycopg2.extras import execute_values
 
-Full ETL Pipeline for HospitalDB Phase 4
-"""
+# ------------------------------------------------------
+# CONFIGURATION
+# ------------------------------------------------------
 
-from helpers import (
-    create_db_engine,
-    load_csv_to_table,
-    run_sql_file,
-    run_data_quality_check
+DB_CONFIG = {
+    "dbname": "hospitaldb",
+    "user": "postgres",
+    "password": "your_password",
+    "host": "localhost",
+    "port": 5432
+}
+
+RAW_DATA_PATH = "phase4/python/data/raw/"
+TRANSFORMED_DATA_PATH = "phase4/python/data/transformed/"
+
+logging.basicConfig(
+    filename="phase4/python/logs/etl.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
 )
-from config import CSV_PATHS
-
-def extract(engine):
-    """Load raw CSVs into raw tables."""
-    load_csv_to_table(CSV_PATHS["patients"], "raw_patients", engine)
-    load_csv_to_table(CSV_PATHS["visits"], "raw_visits", engine)
-    load_csv_to_table(CSV_PATHS["billing"], "raw_billing", engine)
 
 
-def transform(engine):
-    """Execute SQL transformations to populate staging tables."""
-    run_sql_file(engine, "phase1/sql/staging_tables/stg_patients.sql")
-    run_sql_file(engine, "phase1/sql/staging_tables/stg_visits.sql")
-    run_sql_file(engine, "phase1/sql/staging_tables/stg_billing.sql")
+# ------------------------------------------------------
+# EXTRACT
+# ------------------------------------------------------
+
+def extract_csv(file_name: str) -> pd.DataFrame:
+    """Load raw CSV file into a pandas DataFrame."""
+    try:
+        df = pd.read_csv(RAW_DATA_PATH + file_name)
+        logging.info(f"Extracted file: {file_name} ({len(df)} records)")
+        return df
+    except Exception as e:
+        logging.error(f"Extract Error for {file_name}: {str(e)}")
+        raise
 
 
-def load_dimension_and_fact(engine):
-    """Load dimension and fact tables from Phase 3."""
-    run_sql_file(engine, "phase3/sql/dimension_tables/dim_patient.sql")
-    run_sql_file(engine, "phase3/sql/dimension_tables/dim_doctor.sql")
-    run_sql_file(engine, "phase3/sql/dimension_tables/dim_department.sql")
-    run_sql_file(engine, "phase3/sql/dimension_tables/dim_time.sql")
+# ------------------------------------------------------
+# TRANSFORM
+# ------------------------------------------------------
 
-    run_sql_file(engine, "phase3/sql/fact_tables/fact_visits.sql")
-    run_sql_file(engine, "phase3/sql/fact_tables/fact_billing.sql")
-    run_sql_file(engine, "phase3/sql/fact_tables/fact_lab_results.sql")
-    run_sql_file(engine, "phase3/sql/fact_tables/fact_medications.sql")
+def clean_patient_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Example transformation logic for patient data."""
+    try:
+        df.columns = df.columns.str.lower()
 
+        # strip spaces
+        df = df.apply(lambda col: col.str.strip() if col.dtype == "object" else col)
 
-def run_dq_checks(engine):
-    """Perform crucial DQ validations."""
+        # drop duplicates
+        df = df.drop_duplicates()
 
-    # Check for NULL patient IDs
-    run_data_quality_check(
-        engine,
-        "Null patient_id in visits",
-        """
-        SELECT * FROM stg_visits
-        WHERE patient_id IS NULL;
-        """
-    )
-
-    # Check for unknown billing statuses
-    run_data_quality_check(
-        engine,
-        "Invalid billing status",
-        """
-        SELECT * FROM stg_billing
-        WHERE status NOT IN ('PAID', 'PENDING', 'DENIED');
-        """
-    )
+        logging.info(f"Transformed patient dataframe → {len(df)} rows after cleaning")
+        return df
+    except Exception as e:
+        logging.error(f"Transform Error (patient data): {str(e)}")
+        raise
 
 
-def main():
-    engine = create_db_engine()
+# ------------------------------------------------------
+# LOAD
+# ------------------------------------------------------
 
-    print("RUNNING EXTRACTION...")
-    extract(engine)
+def connect_db():
+    """Create PostgreSQL database connection."""
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        logging.info("Database connection established")
+        return conn
+    except Exception as e:
+        logging.error(f"Database Connection Failed: {e}")
+        raise
 
-    print("RUNNING TRANSFORMATION...")
-    transform(engine)
 
-    print("RUNNING DQ CHECKS...")
-    run_dq_checks(engine)
+def load_to_staging(df: pd.DataFrame, table_name: str):
+    """Bulk load a DataFrame into a PostgreSQL staging table."""
+    try:
+        conn = connect_db()
+        cur = conn.cursor()
 
-    print("LOADING DIMENSIONS & FACTS...")
-    load_dimension_and_fact(engine)
+        cols = ",".join(df.columns)
+        values = [tuple(x) for x in df.to_numpy()]
 
-    print("ETL COMPLETED SUCCESSFULLY.")
+        sql = f"INSERT INTO {table_name} ({cols}) VALUES %s"
+
+        execute_values(cur, sql, values)
+        conn.commit()
+
+        logging.info(f"Loaded {len(df)} records into {table_name}")
+        conn.close()
+
+    except Exception as e:
+        logging.error(f"Load Error into {table_name}: {e}")
+        raise
+
+
+# ------------------------------------------------------
+# MAIN ETL PROCESS
+# ------------------------------------------------------
+
+def run_etl():
+    """
+    Full ETL Pipeline:
+    1. Extract CSVs
+    2. Clean & Transform
+    3. Load into PostgreSQL staging tables
+    """
+
+    logging.info("ETL Pipeline Started")
+
+    try:
+        # ------------------- Extract -------------------
+        patients_df = extract_csv("patients.csv")
+
+        # ------------------ Transform -------------------
+        patients_clean_df = clean_patient_data(patients_df)
+
+        # Save transformed version
+        patients_clean_df.to_csv(TRANSFORMED_DATA_PATH + "patients_clean.csv", index=False)
+
+        # ------------------- Load ----------------------
+        load_to_staging(patients_clean_df, "staging_patients")
+
+        logging.info("ETL Pipeline Completed Successfully")
+
+    except Exception as e:
+        logging.error(f"ETL Pipeline Failed: {str(e)}")
+        print("ETL Failed. Check logs for details.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
-
+    run_etl()
